@@ -1,0 +1,582 @@
+---
+title: "Final Study Data Analysis"
+author: "April Kim, Jennifer Podracky, Saurav Datta"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ggplot2)
+library(data.table)
+library(lmtest)
+library(pwr)
+library(lsr)
+library(effsize)
+library(cobalt)
+library(stringr)
+library(AER)
+library(stargazer)
+```
+
+
+##Read in data and reformat##
+```{r}
+assigned_treatment_seq <- data.frame(seq_id = c(1,2,3,4,5,6), 
+                                     day1 = c(0,0,1,1,2,2),
+                                     day2 = c(1,2,0,2,0,1),
+                                     day3 = c(2,1,2,0,1,0))
+d2 <- fread("241 Participant List - Final Study Results - 20181215.csv", na.strings=c("","NA"))
+d2[UserId == 65,]$Q10 <- "In person"
+d2[UserId == 13,]$Q6 <- "Through digital means"
+d2$`Living Situation`[is.na(d2$`Living Situation`)] <- "Other"
+d2$Age[is.na(d2$Age)] <- "Other"
+d2$Q17[is.na(d2$Q17)] <- "Other"
+# stringsAsFactors = F)
+names(d2) <- str_replace_all(names(d2), c(" " = "." , "," = "" ))
+# subset d2 for those who responded (Submitted.Data = 1)
+
+# Not applicable = 0
+# Through digital means = 1
+# In person = 2
+# Both in person and through digital means = 3
+
+d2 <- d2[, .(userId = UserId,
+             treatment_seq = factor(Treatment.Seq),
+             day1_treatment = factor(Q6, levels = c('Not applicable', 'Through digital means', 'In person'),
+                                                             labels = c(0, 1, 2)), 
+             day2_treatment = factor(Q10, levels = c('Not applicable', 'Through digital means', 'In person'),
+                                                             labels = c(0, 1, 2)),
+             day3_treatment = factor(Q14, levels = c('Not applicable', 'Through digital means', 'In person'),
+                                                             labels = c(0, 1, 2)),
+             day1_steps = as.numeric(gsub("\\,", "", Q7)),
+             day2_steps = as.numeric(gsub("\\,", "", Q11)),
+             day3_steps = as.numeric(gsub("\\,", "", Q15)),
+             age_range = factor(Age, levels = c('18 - 24', 
+                                                "25 - 34",
+                                                "35 - 44",
+                                                "45 - 54",
+                                                "55 - 64",
+                                                "65+", "Other"),
+                                labels = c(0, 1, 2, 3, 4, 5, 6)),
+             # gender = factor(Gender),
+             gender = factor(Gender, levels = c('Male', 'Female', 'Gender non-conforming'),
+                                                     labels = c(0, 1, 2)),
+             lives_with_others = factor(Living.Situation, levels = c('Alone', 'With others', "Other"),
+                                                                labels = c(0, 1, 2)),
+             # know_us = factor(Q17),
+             know_us = factor(Q17, levels = c('No', 'Yes', "Other"),
+                                                      labels = c(0, 1, 2)),
+             location_lat = as.double(LocationLatitude),
+             location_long = as.double(LocationLongitude),
+             submitted_data = Submitted.Data
+)]
+
+head(d2, 5)
+
+#Covariate Balance Check 1
+bal.tab(as.numeric(treatment_seq) ~ gender + age_range + lives_with_others + know_us + location_lat + location_long, 
+        data = d2)
+cov_check <- glm(treatment_seq ~ gender + age_range + lives_with_others + know_us + location_lat + location_long, 
+                data = d2, family = "binomial")
+summary(cov_check)
+```
+
+```{r, results='asis'}
+stargazer(cov_check, 
+          dep.var.labels=c("Treatment sequence"),
+          covariate.labels=c("Female", "Gender non-conforming", 
+                             "Ages 25-34",
+                             "Ages 35-44",
+                             "Ages 45-54",
+                             "Ages 55-64",
+                             "Ages 65+", "Agest other",
+                             "Has housemates", "Housemates unknown",
+                             "Knows authors", "Knows authors unkonwn",
+                             "Latitude", "Longitutde"),
+          omit.stat=c("all"),
+          single.row = TRUE)
+```
+
+## attrition check
+```{r}
+lm_attrit <- lm(submitted_data ~ treatment_seq + age_range + gender + lives_with_others + know_us + location_lat + location_long, data = d2)
+summary(lm_attrit)
+# know_us is highly predictive of whether or not people attrited. This makes sense.
+```
+
+```{r, results='asis'}
+stargazer(lm_attrit, 
+          dep.var.labels=c("Final survey submitted"),
+          covariate.labels=c("Treatment Seq 2", "Treatment Seq 3", "Treatment Seq 4", "Treatment Seq 5", "Treatment Seq 6",
+                             "Ages 25-34",
+                             "Ages 35-44",
+                             "Ages 45-54",
+                             "Ages 55-64",
+                             "Ages 65+", "Agest other",
+                             "Female", "Gender non-conforming",
+                             "Has housemates", "Housemates unknown",
+                             "Knows authors", "Knows authors unkonwn",
+                             "Latitude", "Longitutde"),
+          omit.stat=c("all"),
+          single.row = TRUE)
+```
+
+##Checking for ordering/priming effect AND adding non-compliant but okay users##
+##Is previous day's treatment highly predictive of how many steps are taken today?##
+```{r}
+'%!in%' <- function(x,y)!('%in%'(x,y))
+
+d2 <- d2[submitted_data == 1]
+
+# n = 51
+df1 <- d2
+
+# remove subjects/rows who were non-compliant (n = 2)
+# n = 49
+df1 <- df1[rowSums(is.na(df1[,c(6:8)])) != ncol(df1[,c(6:8)]), ]
+
+head(df1, 5)
+
+# n = 30
+d_followed_treatment_sequence <- rbindlist(list(subset(df1, treatment_seq == 1 & df1$day1_treatment == assigned_treatment_seq[1,2]
+                                                       & df1$day2_treatment == assigned_treatment_seq[1,3]
+                                                       & df1$day3_treatment == assigned_treatment_seq[1,4]),                            
+                                                subset(df1, treatment_seq == 2 & df1$day1_treatment == assigned_treatment_seq[2,2]
+                                                       & df1$day2_treatment == assigned_treatment_seq[2,3]
+                                                       & df1$day3_treatment == assigned_treatment_seq[2,4]),
+                                                subset(df1, treatment_seq == 3 & df1$day1_treatment == assigned_treatment_seq[3,2]
+                                                       & df1$day2_treatment == assigned_treatment_seq[3,3]
+                                                       & df1$day3_treatment == assigned_treatment_seq[3,4]),
+                                                subset(df1, treatment_seq == 4 & df1$day1_treatment == assigned_treatment_seq[4,2]
+                                                       & df1$day2_treatment == assigned_treatment_seq[4,3]
+                                                       & df1$day3_treatment == assigned_treatment_seq[4,4]),
+                                                subset(df1, treatment_seq == 5 & df1$day1_treatment == assigned_treatment_seq[5,2]
+                                                       & df1$day2_treatment == assigned_treatment_seq[5,3]
+                                                       & df1$day3_treatment == assigned_treatment_seq[5,4]),
+                                                subset(df1, treatment_seq == 6 & df1$day1_treatment == assigned_treatment_seq[6,2]
+                                                       & df1$day2_treatment == assigned_treatment_seq[6,3]
+                                                       & df1$day3_treatment == assigned_treatment_seq[6,4])
+))
+
+# n = 19
+d_not_followed_treatment_sequence <- subset(df1, userId %!in% d_followed_treatment_sequence$userId)
+
+d_not_followed_but_ok <- subset(d_not_followed_treatment_sequence, d_not_followed_treatment_sequence$day1_treatment != d_not_followed_treatment_sequence$day2_treatment & 
+                                  d_not_followed_treatment_sequence$day1_treatment != d_not_followed_treatment_sequence$day3_treatment &
+                                  d_not_followed_treatment_sequence$day2_treatment != d_not_followed_treatment_sequence$day3_treatment)
+
+na.omit(d_not_followed_but_ok)
+d_not_followed_no_NA <- subset(d_not_followed_treatment_sequence, userId %!in% d_not_followed_but_ok$userId)
+# n = 15
+d_not_followed_no_NA <- na.omit(d_not_followed_no_NA)
+
+# n = 33
+df <- rbind(d_followed_treatment_sequence, d_not_followed_but_ok)
+# n = 48
+df2 <- rbind(d_followed_treatment_sequence, d_not_followed_but_ok, d_not_followed_no_NA)
+
+# day 3 steps using day 1 and 2 treatment on complied + people who followed within subject design
+m1 <- lm(day3_steps ~ day1_treatment + day2_treatment, df)
+summary(m1)
+# ATE (standard error)
+print(paste0("Estimated effect of day1 treatment: ", signif(m1$coefficients[2], 3),
+" (", signif(coef(summary(m1))[2,2], 3), ")"))
+print(paste0("Estimated effect of day2 treatment: ", signif(m1$coefficients[3], 3),
+" (", signif(coef(summary(m1))[3,2], 3), ")"))
+# include days1,2 steps as covariates to understand
+# subjects' step counts have as a function of
+# treatment against waht they would typically do
+m2 <- lm(day3_steps ~ day1_treatment + day2_treatment + day1_steps + day2_steps, df)
+summary(m2)
+print(paste0("Estimated effect of day1 treatment: ", signif(m2$coefficients[2], 3),
+             " (", signif(coef(summary(m2))[2,2], 3), ")"))
+print(paste0("Estimated effect of day2 treatment: ", signif(m2$coefficients[3], 3),
+             " (", signif(coef(summary(m2))[3,2], 3), ")"))
+
+# day 3 steps using day 1 and 2 treatment on complied + people who followed within subject design + rest who submitted data without any missing data
+m1 <- lm(day3_steps ~ day1_treatment + day2_treatment, df2)
+summary(m1)
+# ATE (standard error)
+print(paste0("Estimated effect of day1 treatment: ", signif(m1$coefficients[2], 3),
+             " (", signif(coef(summary(m1))[2,2], 3), ")"))
+print(paste0("Estimated effect of day2 treatment: ", signif(m1$coefficients[3], 3),
+             " (", signif(coef(summary(m1))[3,2], 3), ")"))
+# include days1,2 steps as covariates to understand
+# subjects' step counts have as a function of
+# treatment against waht they would typically do
+m2 <- lm(day3_steps ~ day1_treatment + day2_treatment + day1_steps + day2_steps, df2)
+summary(m2)
+print(paste0("Estimated effect of day1 treatment: ", signif(m2$coefficients[2], 3),
+             " (", signif(coef(summary(m2))[2,2], 3), ")"))
+print(paste0("Estimated effect of day2 treatment: ", signif(m2$coefficients[3], 3),
+             " (", signif(coef(summary(m2))[3,2], 3), ")"))
+```
+We do not see that the previous days' treatment assignments to predict the last day's step count is highgly predicitive and significant, which is super for us! 
+
+```{r, results='asis'}
+stargazer(m1, m2, 
+          dep.var.labels=c("Steps - Day 3"),
+          column.labels=c("Short", "Long"),
+          covariate.labels=c("Digital - Day 1", "In person - Day 1", "Digital - Day 2", "In person - Day 2", "Steps - Day 1", "Steps - Day 2"),
+          omit.stat=c("all"),
+          single.row = TRUE)
+```
+
+##Condense treatment sequence to 1 treatment##
+```{r}
+df1.1 <- df[,-c(4,5,7,8)] 
+df2.1 <- df[,-c(3,5,6,8)] 
+df3.1 <- df[,-c(3,4,6,7)] 
+names(df1.1)[names(df1.1) == "day1_treatment"] = "treatment"
+names(df1.1)[names(df1.1) == "day1_steps"] = "steps"
+names(df2.1)[names(df2.1) == "day2_treatment"] = "treatment"
+names(df2.1)[names(df2.1) == "day2_steps"] = "steps"
+names(df3.1)[names(df3.1) == "day3_treatment"] = "treatment"
+names(df3.1)[names(df3.1) == "day3_steps"] = "steps"
+d <- rbind(df1.1, df2.1, df3.1)
+# combine digital and in person treatment as one
+d$treatment2 <- ifelse(d$treatment == 0, 0, 1)
+d$outcome <- ifelse(d$steps > 5000, 1, 0)
+
+head(d, 5)
+
+#Covariate Balance Check on treatment = 0,1,2
+bal.tab(as.numeric(treatment) ~ gender + age_range + lives_with_others + know_us + location_lat + location_long,
+       data = d)
+cov_check1 <- glm(treatment ~ gender + age_range + lives_with_others + know_us + location_lat + location_long,
+               data = d, family = "binomial")
+summary(cov_check1)
+
+#Covariate Balance Check on treatment = 0,1
+bal.tab(as.numeric(treatment2) ~ gender + age_range + lives_with_others + know_us + location_lat + location_long,
+       data = d)
+cov_check2 <- glm(treatment2 ~ gender + age_range + lives_with_others + know_us + location_lat + location_long,
+               data = d, family = "binomial")
+summary(cov_check2)
+```
+
+```{r, results='asis'}
+stargazer(cov_check2, cov_check1, 
+          dep.var.labels=c("2 levels treatment", "3 levels treatment"),
+          covariate.labels=c("Female",
+                             "Ages 25-34",
+                             "Ages 35-44",
+                             "Ages 45-54",
+                             "Ages 55-64",
+                             "Ages 65+", 
+                             "Has housemate", "Knows us","Latitute", "Longitude", "Constant"),          
+          omit.stat=c("all"),
+          single.row = TRUE)
+```
+
+##Make some pretty plots to show distribution, populatin etc. ##
+```{r}
+# population that actually responded to data collection survey
+require(gridExtra)
+d.gender <- d[, c("gender", "treatment2")]
+p_gender <- ggplot(d.gender, aes(x=gender, fill = factor(treatment2))) + 
+  geom_bar(stat="count", position=position_dodge()) +
+  theme_minimal() + theme(legend.position="right",
+                          panel.border = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank()) +
+  xlab("") + ylab("") + ggtitle("Gender") +
+  guides(fill = guide_legend(title = "Assignment")) +
+  scale_fill_discrete(labels = c("Control", "Treatment")) +
+  scale_x_discrete(breaks = c(0, 1, 2), 
+                     labels = c('Male', 'Female', 'Gender\n non-conforming'))
+# ggsave("gender.png", width = 5, height = 3.5, units = "in",dpi = 300)
+
+p_gender_no_legend <- ggplot(d.gender, aes(x=gender, fill = factor(treatment2))) + 
+  geom_bar(stat="count", position=position_dodge()) +
+  theme_minimal() + theme(legend.position="right",
+                          panel.border = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank()) +
+  xlab("") + ylab("") + ggtitle("Gender") +
+  # guides(fill = guide_legend(title = "Assignment")) +
+  # scale_fill_discrete(labels = c("Control", "Treatment")) +
+  scale_x_discrete(breaks = c(0, 1, 2), 
+                     labels = c('Male', 'Female', 'Gender\n non-conforming'))
+
+
+d.age <- d[, c("age_range", "treatment2")]
+p_age <- ggplot(d.age, aes(x=age_range, fill = factor(treatment2))) + 
+  geom_bar(stat="count", position=position_dodge()) +
+  theme_minimal() + theme(legend.position="right",
+                          panel.border = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank()) + 
+  xlab("") + ylab("") + ggtitle("Age range") +
+  guides(fill = guide_legend(title = "Assignment")) +
+  scale_fill_discrete(labels = c("Control", "Treatment")) +
+  scale_x_discrete(breaks = c(0, 1, 2, 3, 4, 5, 6 ), 
+                   labels = c('18 - 24', 
+                              "25 - 34",
+                              "35 - 44",
+                              "45 - 54",
+                              "55 - 64",
+                              "65+", "NA"))
+
+d.others <- d[, c("lives_with_others", "treatment2")]
+p_others <- ggplot(d.others, aes(x=lives_with_others, fill = factor(treatment2))) + 
+  geom_bar(stat="count", position=position_dodge()) +
+  theme_minimal() + theme(legend.position="right",
+                          panel.border = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank()) +
+  xlab("") + ylab("") + ggtitle("Lives with others") +
+  guides(fill = guide_legend(title = "Assignment")) +
+  scale_fill_discrete(labels = c("Control", "Treatment")) +
+  scale_x_discrete(breaks = c(0, 1, 2), 
+                     labels = c('Alone', 'With others', "NA"))
+ggsave("other.png", width = 5, height = 3.5, units = "in",dpi = 300)
+
+
+d.know_us <- d[, c("know_us", "treatment2")]
+p_know_us <- ggplot(d.know_us, aes(x=know_us, fill = factor(treatment2))) + 
+  geom_bar(stat="count", position=position_dodge()) +
+  theme_minimal() + theme(legend.position="right",
+                          panel.border = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank()) +
+  xlab("") + ylab("") + ggtitle("Know us") +
+  guides(fill = guide_legend(title = "Assignment")) +
+  scale_fill_discrete(labels = c("Control", "Treatment")) +
+  scale_x_discrete(breaks = c(0, 1), 
+                     labels = c('No', 'Yes'))
+ggsave("know.png", width = 5, height = 3.5, units = "in",dpi = 300)
+
+
+grid.arrange(p_gender_no_legend, p_age, p_others, p_know_us,
+             ncol = 2)
+
+
+# control and digital and in person distribution 
+dist3 <- ggplot(d, aes(x=treatment, y=steps, colour = factor(treatment))) +
+geom_boxplot() + geom_jitter() +
+geom_hline(yintercept=5000, linetype="dashed", color = "red") +
+xlab("") + ylab("") + theme_bw() + 
+   theme(axis.text.y = element_blank(), axis.ticks = element_blank()) 
+    # scale_x_discrete(breaks = c(0, 1, 2), 
+                     # labels = c('None', 'Digital', "In-person")) +
+  # theme(legend.position="none")
+
+# control and treatment (digital+in person) when time component removed
+dist2 <- ggplot(d, aes(x=treatment2, y=steps, colour = factor(treatment2))) +
+geom_boxplot() + geom_jitter() +
+geom_hline(yintercept=5000, linetype="dashed", color = "red") +
+xlab("") + ylab("Step counts") + theme_bw() + theme(axis.ticks.x = element_blank()) +
+    scale_x_continuous(breaks = c(0, 1), 
+                     labels = c('Control', 'Treatment')) +
+  theme(legend.position="none")
+
+grid.arrange(dist2, dist3,
+             ncol = 2)
+
+```
+
+
+## For control vs digital and control vs in person ##
+```{r}
+# d$treatment <- factor(d$treatment)
+d$userId <- factor(d$userId)
+fit_3 <- lm(outcome ~ treatment + userId , d)
+# se clustered based on userID
+se_3 <- coeftest(fit_3, vcovHC(fit_3, type = 'HC', cluster = "userID"))
+
+fit_3_covariates <- lm(outcome ~ treatment + age_range + gender + lives_with_others + know_us + location_lat + location_long, d)
+# robust se
+se_3_covariates <- sqrt(diag(vcovHC(fit_3_covariates, type = 'HC')))
+
+# ATE (standard error)
+print(paste0("Estimated effect of treatment (control, in person, digital): ", signif(fit_3$coefficients[2], 3),
+" (", signif(se_3[2,2], 3), ")"))
+print(paste0("Estimated effect of treatment (control, in person, digital) + covariates: ", signif(fit_3_covariates$coefficients[3], 3),
+" (", signif(se_3_covariates[2], 3), ")"))
+
+```
+
+
+```{r, results='asis'}
+stargazer(fit_3,
+          se=list(se_3[,2]),
+          omit = "userId",
+          omit.labels = "Subject IDs ommitted",
+          dep.var.labels=c("Steps > 5000"),
+          covariate.labels=c('Digital commitment', 'In person commitment',"Constant"),
+          omit.stat=c("all"),
+          single.row = TRUE)
+
+stargazer(fit_3,
+          se=list(se_3[,2]),
+          dep.var.labels=c("Steps > 5000"),
+          covariate.labels=c('Digital commitment', 'In person commitment',"Constant"),
+          omit.stat=c("all"),
+          single.row = TRUE)
+```
+
+```{r, results='asis'}
+stargazer(fit_3, fit_3_covariates, 
+          se=list(se_3[,2], se_3_covariates),
+                    omit = "userId",
+          omit.labels = "Subject IDs ommitted",
+          dep.var.labels=c("Steps > 5000"),
+          column.labels = c("User ID", "Covariates"),
+          covariate.labels=c('Digital commitment', 
+                             'In person commitment',
+                             "Ages 25-34",
+                             "Ages 35-44",
+                             "Ages 45-54",
+                             "Ages 55-64",
+                             "Ages 65+", 
+                             "Female","Has housemate", 
+                             "Knows us",
+                             "Latitute", 
+                             "Longitude", 
+                             "Constant"),
+          omit.stat=c("all"),
+          single.row = TRUE)
+```
+
+## test hypothesis that telling others make it more likely to take >5000 steps (control vs treatment) ##
+```{r}
+#suppress intercept term
+fit_2 <- lm(outcome ~ treatment2 + userId, d)
+#  se clustered based on userID
+se_2 <- coeftest(fit_2, vcovHC(fit_2, type = 'HC', cluster = "userID"))
+
+fit_2_covariates <- lm(outcome ~ treatment2 + age_range + gender + lives_with_others + know_us + location_lat + location_long, d)
+# robust se
+se_2_covariates <- sqrt(diag(vcovHC(fit_2_covariates, type = 'HC')))
+
+# ATE (standard error)
+print(paste0("Estimated effect of treatment (control, treatment): ", signif(fit_2$coefficients[2], 3),
+" (", signif(se_2[2], 3), ")"))
+
+print(paste0("Estimated effect of treatment (control, treatment) + covariates: ", signif(fit_2_covariates$coefficients[2], 3),
+" (", signif(se_2_covariates[2], 3), ")"))
+
+```
+
+```{r, results='asis'}
+stargazer(fit_2,
+          se=list(se_2[,2]),
+          omit = "userId",
+          omit.labels = "Subject IDs ommitted",
+          dep.var.labels=c("Steps > 5000"),
+          covariate.labels=c('Social commitment', "Constant"),
+          omit.stat=c("all"),
+          single.row = TRUE)
+
+stargazer(fit_2,
+          se=list(se_2[,2]),
+          dep.var.labels=c("Steps > 5000"),
+          covariate.labels=c('Social commitment', "Constant"),
+          omit.stat=c("all"),
+          single.row = TRUE)
+```
+
+
+```{r, results='asis'}
+stargazer(fit_2, fit_2_covariates, 
+          se=list(se_2[,2], se_2_covariates),
+          omit = "userId",
+          omit.labels = "Subject IDs ommitted",
+          dep.var.labels=c("Steps > 5000"),
+          column.labels = c("User ID", "Covariates"),
+          covariate.labels=c('Social commitment',
+                             "Ages 25-34",
+                             "Ages 35-44",
+                             "Ages 45-54",
+                             "Ages 55-64",
+                             "Ages 65+", 
+                             "Female",
+                             "Has housemate", 
+                             "Knows us",
+                             "Latitute", 
+                             "Longitude", 
+                             "Constant"),          
+          omit.stat=c("all"),
+          single.row = TRUE)
+
+
+
+```
+
+##power calculations##
+.  
+.  
+.  
+.  
+.  
+.  
+```{r}
+### power analysis
+###  Control vs treatment (digital + in person)
+# hedge's g
+(cohen.d(d[treatment2 == 0]$outcome, d[treatment2 == 1]$outcome, na.rm = T, hedges.correction = T))
+# cohen's d
+effect_size <- cohensD(d[treatment2 == 0]$outcome, d[treatment2 == 1]$outcome)
+#power we got from our experiment
+pwr.t2n.test(n1 = nrow(d[treatment2 == 0,]), n2 = nrow(d[treatment2 == 1,]), d = effect_size, sig.level = 0.05)
+# 80% powered test
+pwr.t.test(power = 0.8, d = effect_size, sig.level = 0.05, type = "two.sample")
+
+#
+#
+#
+#
+# ###  Control vs in person
+# # since we fail to reject the null hypothesis, 
+# # let's calculate number of subjects needed for 80% power
+# effect_size_person <- cohensD(d[treatment == 0]$steps, d[treatment == 2]$steps)
+# #power we got from our experiment
+# pwr.t2n.test(n1 = nrow(d[treatment == 0,]), n2 = nrow(d[treatment == 2,]), d = effect_size_person, sig.level = 0.05)
+# # 80% powered test
+# pwr.t.test(power = 0.8, d = effect_size_person, sig.level = 0.05, type = "two.sample")
+
+
+### extra plots
+# day1
+pd1 <- ggplot(df, aes(x=day1_treatment, y=day1_steps, colour = factor(day1_treatment))) +
+  geom_boxplot() + geom_jitter() +
+  geom_hline(yintercept=5000, linetype="dashed", color = "red") +
+  xlab("") + ylab("Step counts") + theme_bw() +
+  scale_x_continuous(breaks = c(0, 1, 2),
+                     labels = c(0, 1, 2)) +
+  # labels = c('Control', 'In person', 'Through digital means')) +
+  theme(legend.position="none") + ggtitle("Step count - day 1")
+# day2
+pd2 <- ggplot(df, aes(x=day2_treatment, y=day2_steps, colour = factor(day2_treatment))) +
+geom_boxplot() + geom_jitter() +
+geom_hline(yintercept=5000, linetype="dashed", color = "red") +
+xlab("") + ylab("Step counts") + theme_bw() +
+    scale_x_continuous(breaks = c(0, 1, 2),
+                       labels = c(0, 1, 2)) +
+    #                  labels = c('Control', 'In person', 'Through digital means')) +
+  theme(legend.position="none") + ggtitle("Step count - day 2")
+# day3
+pd3 <- ggplot(df, aes(x=day3_treatment, y=day3_steps, colour = factor(day3_treatment))) +
+geom_boxplot() + geom_jitter() +
+geom_hline(yintercept=5000, linetype="dashed", color = "red") +
+xlab("") + ylab("Step counts") + theme_bw() +
+    scale_x_continuous(breaks = c(0, 1, 2),
+                       labels = c(0, 1, 2)) +
+    #                  labels = c('Control', 'In person', 'Through digital means')) +
+  theme(legend.position="none") + ggtitle("Step count - day 3")
+
+
+
+
+```
+
+
+
+
